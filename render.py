@@ -1,4 +1,5 @@
 # 将一条光线上离散的点合成一个像素点
+# 给定光点以及光线上每一给点的坐标，像素
 from helper import *
 
 
@@ -35,7 +36,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std):
     return gray_map, disp_map, acc_map, weights, depth_map
 
 
-def render_rays(ray_batch, retraw, network_fn, network_query_fn, N_samples, perturb,
+def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb,
                 N_importance, network_fine, raw_noise_std):
 
     #  ray_batch [chunk, 11]
@@ -91,14 +92,12 @@ def render_rays(ray_batch, retraw, network_fn, network_query_fn, N_samples, pert
         raw = network_query_fn(pts, viewdirs, ds, network_fine)
         gray_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std)
 
-    ret = {'gray_map': gray_map, 'disp_map': disp_map, 'acc_map': acc_map}
-    if retraw:
-        ret['raw'] = raw
+    ret = {'color_map': gray_map, 'disp_map': disp_map, 'acc_map': acc_map}
+
     if N_importance > 0:
-        ret['gray_map_0'] = gray_map_0
+        ret['color_map_0'] = gray_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
-        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)
 
     # DEBUG
     for k in ret:
@@ -121,36 +120,3 @@ def batchify_rays(rays_flat, chunk, **kwargs):
 
     all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
-
-def render(H, W, K, chunk, rays, near, far, c2w=None, **kwargs):
-    # 给定相机参数和光线，返回渲染结果
-    # H, W, K, c2w 用于在只给定了渲染坐标时渲染图片时
-    # rays [2, N*H*W, 3]
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, K, c2w)
-        rays_o = torch.reshape(rays_o, [-1, 3]).float()
-        rays_d = torch.reshape(rays_d, [-1, 3]).float()
-    else:
-        rays_o, rays_d = rays  # rays_o光线的原点坐标[N*H*W, 3] , rays_d光线的方向向量[N*H*W, 3]
-
-    viewdirs = rays_d  # viewdirs光线的方向向量[N*H*W, 3] 以下用n代N*H*W
-    # 下面两句的意思是，将每一个向量坐标单位化 最后得到[n, 3]
-    # viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-    # viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
-
-    shape_dirs = rays_d.shape
-    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])  # [n]
-    rays = torch.cat([rays_o, rays_d, near, far], -1)  # [n, 8]
-    rays = torch.cat([rays, viewdirs], -1)  # [n, 11]
-
-    # 开始并行计算光线属性
-    all_ret = batchify_rays(rays, chunk, **kwargs)
-    for k in all_ret:
-        k_sh = list(shape_dirs[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
-
-    k_extract = ['gray_map', 'disp_map', 'acc_map']
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]

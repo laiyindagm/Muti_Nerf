@@ -1,4 +1,8 @@
+import imageio.v2 as imageio
+from render import batchify_rays
 from helper import *
+import time
+from tqdm import tqdm
 
 
 class Pts_Block(nn.Module):
@@ -156,24 +160,23 @@ class Blend_Nerf(nn.Module):
         self.blend_block = Blend_Block(D, W, input_views_ch, input_ds_ch, skip_alpha)
 
     def forward(self, x, data_flag, blend_flag=False):
-        # 如果blend_flag==True, 输出[n, 1或3 + 1 + 3 + 1]
-        # 否则 [n, 1或3 + 1]
+        # 如果blend_flag==True, 那么将输出融合后rgb
         input_pts, input_views, input_ds = torch.split(x, [self.input_ch, self.input_views_ch, self.input_d_ch], dim=-1)
         h = self.pts_block(input_pts)
+
+        if blend_flag:
+            outputs = self.blend_block(h, input_views, input_ds)
+            return outputs
+
         if data_flag == self.rgb_flag:
             outputs = self.rgb_block(h, input_views)
         else:
             outputs = self.ir_block(h, input_views, input_ds)
 
-        if blend_flag:
-            outputs_blend = self.blend_block(h, input_views, input_ds)
-            outputs = torch.cat([outputs, outputs_blend], -1)
-            return outputs
-
         return outputs
 
 
-def create_blend_nerf():
+def create_blend_nerf(basedir, expname):
     # 获得编码器 以及编码后数据（坐标）维度
     L_input = 7
     L_views = 4
@@ -206,5 +209,133 @@ def create_blend_nerf():
     model_fine = Blend_Nerf(netdepth, netwidth, input_ch, input_views_ch, input_ds_ch, skip, feature_D,
                             skip_alpha).to(device)
     grad_vars = list(model.parameters()) + list(model_fine.parameters())
+
+    # 给定点坐标，方向，距离，查询网络，以及其他参数,得到该点在该网络下的输出（[gray,alpha]）
+    # 这样写使得其他模型可以复用run_network
+    def sub_query_fn(data_flag, blend_flag):
+        def network_query_fn(inputs, viewdirs, ds, network_fn):
+            def fn(x):
+                return network_fn(x, data_flag, blend_flag)
+            return run_network(inputs, viewdirs, ds, fn, embed_fn, embed_views_fn, embed_d_fn, netchunk)
+        return network_query_fn
+
+    # 创建网络优化器
+    optimizer = torch.optim.Adam(params=grad_vars, lr=lrate, betas=(0.9, 0.999))
+
+    # 加载检查点
+    check_points = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname)))
+                    if 'tar' in f]
+    if len(check_points) > 0:
+        print('Found ckpts', check_points)
+        check_point_path = check_points[-1]
+        print('Reloading from', check_point_path)
+        check_point = torch.load(check_point_path)
+        # 加载训练数据
+        start = check_point['global_step']
+        optimizer.load_state_dict(check_point['optimizer_state_dict'])
+        # 加载模型
+        model.load_state_dict(check_point['network_fn_state_dict'])
+        model_fine.load_state_dict(check_point['network_fine_state_dict'])
+
+    # 所有参数以字典形式返回
+    render_kwargs_train = {
+        'sub_query_fn': sub_query_fn,
+        'perturb': perturb,
+        'raw_noise_std': raw_noise_std,
+        'N_samples': N_samples, 'N_importance': N_importance,
+        'network_fn': model, 'network_fine': model_fine
+    }
+
+    render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
+    render_kwargs_test['perturb'] = False
+    render_kwargs_test['raw_noise_std'] = 0.0
+
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+
+
+def train_blend_nerf(data_flag, blend_flag, chunk, rays, target_s, near, far, sub_query_fn, **kwargs):
+    # 返回loss, psnr
+    rays_o, rays_d = rays
+    viewdirs = rays_d  # 在生成时就已经是单位向量
+    shape_dirs = rays_d.shape
+    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])  # [n]
+    rays = torch.cat([rays_o, rays_d, near, far], -1)  # [n, 8]
+    rays = torch.cat([rays, viewdirs], -1)  # [n, 11]
+    kwargs['network_query_fn'] = sub_query_fn(data_flag, blend_flag)
+    # 开始并行计算光线属性
+    all_ret = batchify_rays(rays, chunk, **kwargs)
+    for k in all_ret:
+        k_sh = list(shape_dirs[:-1]) + list(all_ret[k].shape[1:])
+        all_ret[k] = torch.reshape(all_ret[k], k_sh)
+
+    color = all_ret['color_map']
+    color_0 = all_ret['color_map_0']
+
+    if blend_flag:
+        if data_flag == Blend_Nerf.rgb_flag:
+            # rgb是真实传入的target_s
+            kwargs['network_query_fn'] = sub_query_fn(Blend_Nerf.ir_flag, False)
+            with torch.no_grad():
+                all_ret = batchify_rays(rays, chunk, **kwargs)
+            for k in all_ret:
+                k_sh = list(shape_dirs[:-1]) + list(all_ret[k].shape[1:])
+                all_ret[k] = torch.reshape(all_ret[k], k_sh)
+            temp = all_ret['color_map'].detach().expand_as(target_s)
+        else:
+            # ir是真实传入的target_s
+            kwargs['network_query_fn'] = sub_query_fn(Blend_Nerf.rgb_flag, False)
+            with torch.no_grad():
+                all_ret = batchify_rays(rays, chunk, **kwargs)
+            for k in all_ret:
+                k_sh = list(shape_dirs[:-1]) + list(all_ret[k].shape[1:])
+                all_ret[k] = torch.reshape(all_ret[k], k_sh)
+            temp = all_ret['color_map'].detach()
+            target_s = target_s.expand_as(temp)
+        target_s = (temp + target_s) / 2
+
+    img_loss = img2mse(color, target_s)  # 差值平方的均值
+    loss = img_loss
+    psnr = mse2psnr(img_loss)  # 将损失转换为 PSNR 指标
+    img_loss0 = img2mse(color_0, target_s)
+    loss = loss + img_loss0
+
+    return loss, psnr
+
+
+def apply_blend_nerf(data_flag, blend_flag, poses, H, W, K, c2w, near, far, chunk, sub_query_fn, savedir, **kwargs):
+    rays_o, rays_d = get_rays(H, W, K, c2w)
+    rays_o = torch.reshape(rays_o, [-1, 3]).float()
+    rays_d = torch.reshape(rays_d, [-1, 3]).float()
+    viewdirs = rays_d
+    shape_dirs = rays_d.shape
+    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])  # [n]
+    rays = torch.cat([rays_o, rays_d, near, far], -1)  # [n, 8]
+    rays = torch.cat([rays, viewdirs], -1)  # [n, 11]
+    kwargs['network_query_fn'] = sub_query_fn(data_flag, blend_flag)
+    colors = []
+
+    t = time.time()
+    for i, c2w in enumerate(tqdm(poses)):
+        print(i, time.time() - t)  # 打印渲染时间
+        t = time.time()
+
+        all_ret = batchify_rays(rays, chunk, **kwargs)
+        for k in all_ret:
+            k_sh = list(shape_dirs[:-1]) + list(all_ret[k].shape[1:])
+            all_ret[k] = torch.reshape(all_ret[k], k_sh)
+        color = all_ret['color_map']
+        if blend_flag is False and data_flag == Blend_Nerf.ir_flag:
+            color = color[..., None].expand([H, W, 3])
+        colors.append(color.cpu().numpy())
+        if i == 0:
+            print(color.shape)
+
+        color8 = to8b(colors[-1])
+        filename = os.path.join(savedir, '{:03d}.png'.format(i))
+        imageio.imwrite(filename, color8)
+
+    colors = np.stack(colors, 0)
+    return colors
+
 
 

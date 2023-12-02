@@ -7,6 +7,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 class Embedder:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -118,6 +119,37 @@ def get_rays_np(H, W, K, c2w):
     # 每条光线的坐标原点的坐标 rays_o的形状是H*W*3
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o, rays_d
+
+
+def batchify(fn, chunk):
+    # 将较小批量的数据送入模型
+    def ret(inputs):
+        return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], dim=0)
+    return ret
+
+
+def run_network(inputs, viewdirs, ds, fn, embed_fn, embed_views_fn, embed_d_fn, netchunk=1024*4):
+    # 对 input 进行处理，应用 神经网络 fn
+
+    # input 是n*N*3 光线数乘光线上采样乘3
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    embedded_inputs = embed_fn(inputs_flat)
+
+    # viewdirs 是 n*3 光线数乘3(3是因为原来的两个量被转化为了向量的坐标表示)
+    input_dirs = viewdirs[:, None].expand(inputs.shape)
+    input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+    embedded_input_dirs = embed_views_fn(input_dirs_flat)
+
+    # ds 是 n*N 光线数乘光线上采样数
+    ds = ds[..., None]
+    input_ds_flat = torch.reshape(ds, [-1, ds.shape[-1]])
+    embedded_input_ds = embed_d_fn(input_ds_flat)
+
+    embedded = torch.cat([embedded_inputs, embedded_input_dirs, embedded_input_ds], -1)
+    # 将数据送入模型，此时数据是nN * (x+y+z)
+    outputs_flat = batchify(fn, netchunk)(embedded)  # 返回nN * x
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])  # n*N*2
+    return outputs
 
 
 # Misc
